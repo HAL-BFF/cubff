@@ -54,6 +54,8 @@ __device__ __host__
 
 constexpr int kSingleTapeSize = 64;
 constexpr int kSelfrepThreshold = 5;
+constexpr int kHistogramOps = 512;   // ops bins: 0..510, 511 = overflow
+constexpr int kHistogramLen = 129;   // length bins: 0..128
 
 struct SimulationParams {
   size_t num_programs = 128 * 1024;
@@ -88,6 +90,7 @@ struct SimulationState {
   std::array<std::pair<std::string, float>, 16> frequent_bytes;
   std::array<std::pair<std::string, float>, 16> uncommon_bytes;
   std::vector<size_t> replication_per_prog;
+  std::vector<uint64_t> histogram;  // kHistogramOps * kHistogramLen, row-major [ops][len]
 };
 
 struct LanguageInterface {
