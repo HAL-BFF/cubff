@@ -145,8 +145,13 @@ inline FILE *CheckFopen(const char *f, const char *mode) {
   FILE *out = fopen(f, mode);
   if (out == nullptr) {
     char buf[4096];
-    (void) strerror_r(errno, buf, sizeof(buf));
-    fprintf(stderr, "Could not open %s: %s\n", f, buf);
+#ifdef __APPLE__
+    strerror_r(errno, buf, sizeof(buf));
+    fprintf(stderr, "Could not open %s: %s\\n", f, buf);
+#else
+    char* msg = strerror_r(errno, buf, sizeof(buf));
+    fprintf(stderr, "Could not open %s: %s\\n", f, msg);
+#endif
     exit(1);
   }
   return out;
