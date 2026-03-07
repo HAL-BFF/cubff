@@ -73,6 +73,9 @@ PYBIND11_MODULE(cubff, m) {
                     &SimulationState::replication_per_prog)
       .def_readonly("histogram", &SimulationState::histogram);
 
+  m.attr("kHistogramOps") = kHistogramOps;
+  m.attr("kHistogramLen") = kHistogramLen;
+
   pybind11::class_<LanguageInterface>(m, "LanguageInterface")
       .def("PrintProgram",
            [](const LanguageInterface* interface, size_t pc_pos,

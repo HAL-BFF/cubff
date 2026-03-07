@@ -54,7 +54,7 @@ __device__ __host__
 
 constexpr int kSingleTapeSize = 64;
 constexpr int kSelfrepThreshold = 5;
-constexpr int kHistogramOps = 512;   // ops bins: 0..510, 511 = overflow
+constexpr int kHistogramOps = 8193;   // OPS bins
 constexpr int kHistogramLen = 129;   // length bins: 0..128
 
 struct SimulationParams {
