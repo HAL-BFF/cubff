@@ -15,7 +15,6 @@
 #include <assert.h>
 #include <signal.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -25,10 +24,8 @@
 #include <type_traits>
 #include <vector>
 
-static std::atomic<bool> g_stop_requested{false};
-static void handle_hup(int) {
-  g_stop_requested.store(true, std::memory_order_relaxed);
-}
+static volatile sig_atomic_t g_stop_requested = 0;
+static void handle_hup(int) { g_stop_requested = 1; }
 
 #include "common.h"
 
@@ -223,7 +220,11 @@ FLAG(std::optional<size_t>, stopping_selfrep_count, std::nullopt,
 int main(int argc, char **argv) {
   flags::ParseCommandLine(argc, argv);
 
-  signal(SIGHUP, handle_hup);
+  struct sigaction sa = {};
+  sa.sa_handler = handle_hup;
+  sa.sa_flags = SA_RESTART;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGHUP, &sa, nullptr);
 
   bool debug = GetFlag(FLAGS_debug);
 
@@ -467,7 +468,7 @@ int main(int argc, char **argv) {
                   params.num_programs / grid_width_2d * 8, draw_buf_2d);
       }
 
-      if (g_stop_requested.load(std::memory_order_relaxed)) {
+      if (g_stop_requested) {
         return true;
       }
       if (max_epochs.has_value() && state.epoch > *max_epochs) {
