@@ -13,7 +13,9 @@
 // limitations under the License.
 
 #include <assert.h>
+#include <signal.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -22,6 +24,11 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+
+static std::atomic<bool> g_stop_requested{false};
+static void handle_hup(int) {
+  g_stop_requested.store(true, std::memory_order_relaxed);
+}
 
 #include "common.h"
 
@@ -215,6 +222,8 @@ FLAG(std::optional<size_t>, stopping_selfrep_count, std::nullopt,
 
 int main(int argc, char **argv) {
   flags::ParseCommandLine(argc, argv);
+
+  signal(SIGHUP, handle_hup);
 
   bool debug = GetFlag(FLAGS_debug);
 
@@ -458,6 +467,9 @@ int main(int argc, char **argv) {
                   params.num_programs / grid_width_2d * 8, draw_buf_2d);
       }
 
+      if (g_stop_requested.load(std::memory_order_relaxed)) {
+        return true;
+      }
       if (max_epochs.has_value() && state.epoch > *max_epochs) {
         return true;
       }
