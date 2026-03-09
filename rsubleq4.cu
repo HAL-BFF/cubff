@@ -143,3 +143,11 @@ struct RSubleq4 {
 
 REGISTER(RSubleq4);
 }  // namespace
+
+#ifdef USE_METAL
+template <>
+struct MetalLanguageTrait<RSubleq4> {
+  static constexpr const char* mutate_kernel_name  = "mutate_and_run_rsubleq4";
+  static constexpr const char* check_selfrep_name  = "check_selfrep_rsubleq4";
+};
+#endif

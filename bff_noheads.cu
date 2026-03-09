@@ -19,3 +19,11 @@ namespace {
 const char *Bff::name() { return "bff_noheads"; }
 
 }  // namespace
+
+#ifdef USE_METAL
+template <>
+struct MetalLanguageTrait<Bff> {
+  static constexpr const char* mutate_kernel_name  = "mutate_and_run_bff_noheads";
+  static constexpr const char* check_selfrep_name  = "check_selfrep_bff_noheads";
+};
+#endif

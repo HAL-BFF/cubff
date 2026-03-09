@@ -81,6 +81,58 @@ struct DeviceMemory {
 
 #define RUN(grid, block, fun, ...) fun<<<grid, block>>>(__VA_ARGS__)
 
+#elif defined(USE_METAL)
+// ---------------------------------------------------------------------------
+// Metal backend: unified-memory DeviceMemory<T> and C-API dispatch.
+// All Metal/ObjC code is in metal_runtime.mm; this header stays pure C++.
+
+#include "metal_runtime.h"
+
+// Kernel function decorators become no-ops in the host C++ path.
+#define __device__
+#define __host__
+#define __global__
+
+inline void Synchronize() { metal_synchronize(); }
+
+// DeviceMemory<T> wraps an MTLBuffer in shared (unified) memory mode.
+// Write() and Read() are plain memcpy — the buffer is always CPU-accessible.
+template <typename T>
+struct DeviceMemory {
+  void* handle_;  // opaque MTLBuffer reference (via metal_buffer_alloc)
+  T*    data;     // direct CPU pointer into the shared buffer
+  DeviceMemory(size_t size) {
+    void* ptr = nullptr;
+    handle_   = metal_buffer_alloc(size * sizeof(T), &ptr);
+    data      = static_cast<T*>(ptr);
+  }
+  void Write(const T* host, size_t count) {
+    memcpy(data, host, count * sizeof(T));
+  }
+  void Read(T* host, size_t count) {
+    memcpy(host, data, count * sizeof(T));
+  }
+  T* Get() { return data; }
+  ~DeviceMemory() { metal_buffer_free(handle_); }
+  DeviceMemory(DeviceMemory&) = delete;
+};
+
+// MetalLanguageTrait<Language> is specialized in each .cu language file to
+// provide the kernel name strings used by the Metal dispatch calls.
+template <typename Language>
+struct MetalLanguageTrait;
+
+// RUN is never called in the Metal path (RunSimulation etc. have #ifdef
+// USE_METAL branches that call metal_dispatch_* directly).  Define it as a
+// compile-time error to catch any missed call sites.
+#define RUN(...) static_assert(false, "RUN macro must not be used in Metal path")
+
+// Stub implementations of device-side helpers (they exist only so that the
+// __global__ kernel templates below compile; they are never called at runtime
+// because the Metal path bypasses the RUN macro entirely).
+inline size_t GetIndex() { return 0; }
+inline void IncreaseInsnCount(unsigned long long, unsigned long long*) {}
+
 #else
 #define __device__
 #define __host__
@@ -279,6 +331,18 @@ __global__ void CheckSelfRep(uint8_t *programs, size_t seed,
 template <typename Language>
 void Simulation<Language>::RunSingleParsedProgram(
     const std::vector<uint8_t> &parsed, size_t stepcount, bool debug) const {
+#ifdef USE_METAL
+  // For the Metal backend, run the program on the CPU.  RunSingleParsedProgram
+  // is a debug/analysis path that is never performance-critical.
+  uint8_t tape[2 * kSingleTapeSize] = {};
+  memcpy(tape, parsed.data(), parsed.size());
+  Language::PrintProgram(2 * kSingleTapeSize, tape, 2 * kSingleTapeSize,
+                         nullptr, 0);
+  size_t ops = Language::Evaluate(tape, stepcount, debug);
+  printf("ops: %d\n\n", (int)ops);
+  Language::PrintProgram(2 * kSingleTapeSize, tape, 2 * kSingleTapeSize,
+                         nullptr, 0);
+#else
   DeviceMemory<uint8_t> mem(kSingleTapeSize * 2);
   uint8_t zero[2 * kSingleTapeSize] = {};
   memcpy(zero, parsed.data(), parsed.size());
@@ -293,6 +357,7 @@ void Simulation<Language>::RunSingleParsedProgram(
   mem.Read(final_state, 2 * kSingleTapeSize);
   Language::PrintProgram(2 * kSingleTapeSize, final_state, 2 * kSingleTapeSize,
                          nullptr, 0);
+#endif
 }
 
 template <typename Language>
@@ -326,16 +391,29 @@ template <typename Language>
 size_t Simulation<Language>::EvalParsedSelfrep(std::vector<uint8_t> &parsed,
                                                size_t epoch, size_t seed,
                                                bool debug) {
+#ifdef USE_METAL
+  metal_auto_init();
+#endif
   DeviceMemory<uint8_t> mem(kSingleTapeSize);
   uint8_t zero[kSingleTapeSize] = {};
   memcpy(zero, parsed.data(), parsed.size());
   mem.Write(zero, kSingleTapeSize);
   DeviceMemory<size_t> result(1);
   size_t epoch_seed = SplitMix64(SplitMix64(seed) ^ SplitMix64(epoch));
+
+#ifdef USE_METAL
+  metal_dispatch_check_selfrep(
+      MetalLanguageTrait<Language>::check_selfrep_name,
+      /*thread_count=*/1,
+      mem.handle_, result.handle_,
+      (uint64_t)epoch_seed, (uint64_t)1);
+  metal_synchronize();
+#else
   RUN(1, 1, CheckSelfRep<Language>, mem.Get(), epoch_seed, 1, result.Get(),
       debug);
-
   Synchronize();
+#endif
+
   std::vector<size_t> res(1);
   result.Read(res.data(), 1);
   return res[0];
@@ -345,8 +423,15 @@ template <typename Language>
 void Simulation<Language>::RunSimulation(
     const SimulationParams &params, std::optional<std::string> initial_program,
     std::function<bool(const SimulationState &)> callback) const {
-  constexpr size_t kNumThreads = 32;
   size_t num_programs = params.num_programs;
+#ifndef USE_METAL
+  constexpr size_t kNumThreads = 32;
+#endif
+
+#ifdef USE_METAL
+  // Lazy one-time initialization: find and load the Metal shader library.
+  metal_auto_init();
+#endif
 
   size_t reset_index = 1;
   size_t epoch = 0;
@@ -360,7 +445,17 @@ void Simulation<Language>::RunSimulation(
   }
 
   DeviceMemory<uint8_t> programs(kSingleTapeSize * num_programs);
+
+  // insn_count accumulates instruction counts from the GPU.
+  // In the Metal path we use one uint64_t slot per thread (no GPU atomics
+  // needed: each thread exclusively owns its slot).  In other paths we use a
+  // single unsigned long long with atomic add.
+#ifdef USE_METAL
+  DeviceMemory<uint64_t> insn_per_thread(num_programs / 2);
+  memset(insn_per_thread.data, 0, (num_programs / 2) * sizeof(uint64_t));
+#else
   DeviceMemory<unsigned long long> insn_count(1);
+#endif
 
   CHECK(num_programs % 2 == 0);
 
@@ -368,17 +463,27 @@ void Simulation<Language>::RunSimulation(
     return SplitMix64(SplitMix64(params.seed) ^ SplitMix64(seed2));
   };
 
+#ifdef USE_METAL
+  metal_dispatch_init_programs(
+      num_programs, programs.handle_,
+      (uint64_t)seed(0), (uint64_t)num_programs,
+      (int)params.zero_init);
+  metal_synchronize();
+#else
   RUN((num_programs + kNumThreads - 1) / kNumThreads, kNumThreads,
       InitPrograms<Language>, seed(0), num_programs, programs.Get(),
       params.zero_init);
+#endif
 
   if (initial_program.has_value()) {
     std::vector<uint8_t> parsed = Language::Parse(*initial_program);
     programs.Write((const unsigned char *)parsed.data(), parsed.size());
   }
 
+#ifndef USE_METAL
   unsigned long long zero = 0;
   insn_count.Write(&zero, 1);
+#endif
 
   unsigned long long total_ops = 0;
 
@@ -487,20 +592,44 @@ void Simulation<Language>::RunSimulation(
 
     shuf_idx.Write(s.data(), num_programs);
 
+#ifdef USE_METAL
+    metal_dispatch_mutate_and_run(
+        MetalLanguageTrait<Language>::mutate_kernel_name,
+        /*thread_count=*/num_programs / 2,
+        programs.handle_, shuf_idx.handle_, insn_per_thread.handle_,
+        (uint64_t)seed(epoch), (uint32_t)params.mutation_prob,
+        (uint64_t)num_programs, (uint64_t)num_indices);
+    // Synchronize after each epoch so the CPU can safely overwrite shuf_idx
+    // for the next epoch without racing the GPU.
+    metal_synchronize();
+#else
     RUN((num_programs + 2 * kNumThreads - 1) / (2 * kNumThreads), kNumThreads,
         MutateAndRunPrograms<Language>, programs.Get(), shuf_idx.Get(),
         seed(epoch), params.mutation_prob, insn_count.Get(), num_programs,
         num_indices);
+#endif
     num_runs += num_indices;
 
     if (epoch % params.callback_interval == 0) {
       auto stop = std::chrono::high_resolution_clock::now();
+#ifdef USE_METAL
+      // GPU has already been synchronized after the last dispatch above.
+      // Sum per-thread instruction counts (CPU-side, no atomic needed).
+      unsigned long long insn = 0;
+      for (size_t ti = 0; ti < num_programs / 2; ti++) {
+        insn += insn_per_thread.data[ti];
+      }
+      // soup is the shared programs buffer; no copy needed.
+      memcpy(state.soup.data(), programs.data,
+             num_programs * kSingleTapeSize);
+#else
       Synchronize();
       unsigned long long insn;
       insn_count.Read(&insn, 1);
-      total_ops += insn;
       programs.Read(state.soup.data(), num_programs * kSingleTapeSize);
       Synchronize();
+#endif
+      total_ops += insn;
       size_t brotli_size = brotlified_data.size();
       BrotliEncoderCompress(2, 24, BROTLI_MODE_GENERIC, state.soup.size(),
                             state.soup.data(), &brotli_size,
@@ -562,9 +691,18 @@ void Simulation<Language>::RunSimulation(
 
       if (params.eval_selfrep) {
         DeviceMemory<size_t> result(num_programs);
+#ifdef USE_METAL
+        metal_dispatch_check_selfrep(
+            MetalLanguageTrait<Language>::check_selfrep_name,
+            /*thread_count=*/num_programs,
+            programs.handle_, result.handle_,
+            (uint64_t)seed(epoch), (uint64_t)num_programs);
+        metal_synchronize();
+#else
         RUN(num_programs / kNumThreads, kNumThreads, CheckSelfRep<Language>,
             programs.Get(), seed(epoch), num_programs, result.Get(), false);
         Synchronize();
+#endif
         result.Read(state.replication_per_prog.data(), num_programs);
       }
       if (params.save_to.has_value() && (epoch % params.save_interval == 0)) {
@@ -584,13 +722,26 @@ void Simulation<Language>::RunSimulation(
       }
       num_runs = 0;
       start = std::chrono::high_resolution_clock::now();
+#ifdef USE_METAL
+      // Reset per-thread instruction counts for the next callback interval.
+      memset(insn_per_thread.data, 0, (num_programs / 2) * sizeof(uint64_t));
+#else
       insn_count.Write(&zero, 1);
+#endif
     }
 
     if (params.reset_interval.has_value() &&
         epoch % *params.reset_interval == 0) {
+#ifdef USE_METAL
+      metal_dispatch_init_programs(
+          num_programs, programs.handle_,
+          (uint64_t)seed(reset_index), (uint64_t)num_programs,
+          (int)params.zero_init);
+      metal_synchronize();
+#else
       RUN(num_programs / kNumThreads, kNumThreads, InitPrograms<Language>,
           seed(reset_index), num_programs, programs.Get(), params.zero_init);
+#endif
       reset_index++;
     }
   }

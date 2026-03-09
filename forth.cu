@@ -29,3 +29,11 @@ void Forth::InitByteColors(
   }
 }
 }  // namespace
+
+#ifdef USE_METAL
+template <>
+struct MetalLanguageTrait<Forth> {
+  static constexpr const char* mutate_kernel_name  = "mutate_and_run_forth";
+  static constexpr const char* check_selfrep_name  = "check_selfrep_forth";
+};
+#endif
